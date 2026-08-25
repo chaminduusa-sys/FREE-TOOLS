@@ -1,22 +1,24 @@
 /**
- * PastPapers.wiki Scraper for Node.js
+ * PastPapers.wiki All-in-One Scraper for Node.js
  * -------------------------------------------------------------
  * Standalone, zero-dependency scraper module for https://pastpapers.wiki/
- * Works on Node.js 18+ (uses native fetch)
+ * Supports ALL Papers:
+ *  - Grade 5 Scholarship (ශිෂ්‍යත්ව)
+ *  - G.C.E. O/L (සාමාන්‍ය පෙළ - Grade 10 & 11)
+ *  - G.C.E. A/L (උසස් පෙළ - Grade 12 & 13)
+ *  - Provincial & School Term Test Papers (Grade 1 to 13 - All Provinces)
+ *  - Marking Schemes & Model Papers
+ *  - School Textbooks (Grade 1 to 11)
+ *  - Mediums: Sinhala, Tamil, English
  * 
- * Features:
- *  - Search past papers, model papers, marking schemes
- *  - Scrape direct PDF download links, Google Drive links & preview links
- *  - Scrape post metadata (Exam, Grade, Subject, Medium, Year, Preview Images)
- *  - Get latest past papers & category listings
- *  - Helper to directly download PDF files to local disk
+ * Works on Node.js 18+ (uses native fetch)
  */
 
 const fs = require('fs');
 const path = require('path');
 
 const BASE_URL = 'https://pastpapers.wiki';
-const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 /**
  * Perform an HTTP fetch with default headers & timeout
@@ -69,140 +71,203 @@ function decodeHtmlEntities(str) {
 }
 
 /**
- * Search pastpapers.wiki by query keyword
- * @param {string} query Search keyword (e.g., '2023 physics', 'scholarship', 'grade 11 science')
+ * Clean and format raw WP Post/Page item
+ */
+function formatWpItem(item, type = 'post') {
+  const featuredImg = item._embedded?.['wp:featuredmedia']?.[0]?.source_url 
+                   || item._embedded?.['wp:featuredmedia']?.[0]?.media_details?.sizes?.full?.source_url 
+                   || null;
+
+  const rawExcerpt = item.excerpt?.rendered ? item.excerpt.rendered.replace(/<[^>]+>/g, '').trim() : '';
+
+  return {
+    id: item.id,
+    type: type,
+    title: decodeHtmlEntities(item.title?.rendered || ''),
+    url: item.link,
+    slug: item.slug,
+    date: item.date,
+    image: featuredImg,
+    excerpt: decodeHtmlEntities(rawExcerpt)
+  };
+}
+
+/**
+ * Universal Search across ALL Past Papers, O/L, A/L, Scholarship, and Term Tests
+ * Searches both WP Posts and WP Pages in parallel with optional filtering.
+ * 
+ * @param {string} query Search keyword (e.g. 'grade 5 scholarship', 'o/l science', 'grade 11 mathematics', 'western province term test')
  * @param {object} [options]
  * @param {number} [options.page=1] Page number
- * @param {number} [options.per_page=10] Results per page (max 100)
- * @returns {Promise<Array<{id: number, title: string, url: string, date: string, image: string|null, excerpt: string}>>}
+ * @param {number} [options.per_page=10] Results per page
+ * @param {string} [options.grade] Filter by grade (e.g. '5', '10', '11', '12', '13', 'scholarship', 'ol', 'al')
+ * @param {string} [options.medium] Filter by medium ('sinhala' | 'english' | 'tamil')
+ * @param {string} [options.category] Specific category ID or slug
+ * @returns {Promise<Array<{id: number, type: string, title: string, url: string, date: string, image: string|null, excerpt: string}>>}
  */
 async function search(query, options = {}) {
-  if (!query || typeof query !== 'string') {
-    throw new Error('Search query must be a non-empty string');
+  let searchQuery = query || '';
+  
+  // Combine filters into query if specified
+  if (options.grade) searchQuery += ` grade ${options.grade}`;
+  if (options.medium) searchQuery += ` ${options.medium} medium`;
+  if (options.subject) searchQuery += ` ${options.subject}`;
+
+  searchQuery = searchQuery.trim();
+  if (!searchQuery) {
+    throw new Error('Search query must be provided');
   }
 
   const page = options.page || 1;
   const perPage = options.per_page || 10;
-  const apiUrl = `${BASE_URL}/wp-json/wp/v2/posts?search=${encodeURIComponent(query)}&page=${page}&per_page=${perPage}&_embed`;
+
+  const postsUrl = `${BASE_URL}/wp-json/wp/v2/posts?search=${encodeURIComponent(searchQuery)}&page=${page}&per_page=${perPage}&_embed`;
+  const pagesUrl = `${BASE_URL}/wp-json/wp/v2/pages?search=${encodeURIComponent(searchQuery)}&page=${page}&per_page=${Math.min(perPage, 10)}&_embed`;
 
   try {
-    const res = await fetchHtml(apiUrl, options);
-    
-    if (res.status === 400 || res.status === 404) {
-      return []; // No more pages or results
+    const [postsRes, pagesRes] = await Promise.all([
+      fetchHtml(postsUrl, options).catch(() => null),
+      fetchHtml(pagesUrl, options).catch(() => null)
+    ]);
+
+    const results = [];
+    const seenUrls = new Set();
+
+    // 1. Process Posts
+    if (postsRes && postsRes.ok) {
+      const postsData = await postsRes.json();
+      if (Array.isArray(postsData)) {
+        for (const p of postsData) {
+          if (!seenUrls.has(p.link)) {
+            seenUrls.add(p.link);
+            results.push(formatWpItem(p, 'post'));
+          }
+        }
+      }
     }
 
-    if (!res.ok) {
-      throw new Error(`Failed to search: HTTP ${res.status} ${res.statusText}`);
+    // 2. Process Pages (Hubs, Subject Index Pages)
+    if (pagesRes && pagesRes.ok) {
+      const pagesData = await pagesRes.json();
+      if (Array.isArray(pagesData)) {
+        for (const p of pagesData) {
+          if (!seenUrls.has(p.link)) {
+            seenUrls.add(p.link);
+            results.push(formatWpItem(p, 'page'));
+          }
+        }
+      }
     }
 
-    const posts = await res.json();
-    if (!Array.isArray(posts)) return [];
-
-    return posts.map(post => {
-      const featuredImg = post._embedded?.['wp:featuredmedia']?.[0]?.source_url 
-                       || post._embedded?.['wp:featuredmedia']?.[0]?.media_details?.sizes?.full?.source_url 
-                       || null;
-
-      const rawExcerpt = post.excerpt?.rendered ? post.excerpt.rendered.replace(/<[^>]+>/g, '').trim() : '';
-
-      return {
-        id: post.id,
-        title: decodeHtmlEntities(post.title?.rendered || ''),
-        url: post.link,
-        slug: post.slug,
-        date: post.date,
-        image: featuredImg,
-        excerpt: decodeHtmlEntities(rawExcerpt)
-      };
-    });
+    return results;
   } catch (error) {
-    // Fallback: If REST API is blocked or restricted, parse search HTML
-    return fallbackHtmlSearch(query, page, options);
+    return [];
   }
 }
 
 /**
- * Fallback search parser using standard WordPress search HTML
- */
-async function fallbackHtmlSearch(query, page = 1, options = {}) {
-  const searchUrl = `${BASE_URL}/page/${page}/?s=${encodeURIComponent(query)}`;
-  const res = await fetchHtml(searchUrl, options);
-  if (!res.ok) return [];
-
-  const html = await res.text();
-  const results = [];
-  const articleRegex = /<article[^>]*class=["']([^"']*)["'][^>]*>([\s\S]*?)<\/article>/gi;
-  let match;
-
-  while ((match = articleRegex.exec(html)) !== null) {
-    const articleHtml = match[2];
-
-    const titleMatch = articleHtml.match(/<h2[^>]*class=["'][^"']*jeg_post_title[^"']*["'][^>]*>\s*<a\s+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i)
-                    || articleHtml.match(/<a\s+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/i);
-    
-    const postUrl = titleMatch ? titleMatch[1] : null;
-    const postTitle = titleMatch ? decodeHtmlEntities(titleMatch[2].replace(/<[^>]+>/g, '')) : '';
-
-    const imgMatch = articleHtml.match(/<img[^>]+(?:data-src|src)=["']([^"']+)["']/i);
-    const postImg = imgMatch ? imgMatch[1] : null;
-
-    const dateMatch = articleHtml.match(/<div class=["']jeg_meta_date["']>\s*<a[^>]*>([\s\S]*?)<\/a>/i);
-    const postDate = dateMatch ? dateMatch[1].replace(/<[^>]+>/g, '').trim() : null;
-
-    if (postUrl && postTitle) {
-      results.push({
-        id: null,
-        title: postTitle,
-        url: postUrl,
-        slug: postUrl.replace(BASE_URL, '').replace(/^\/|\/$/g, ''),
-        date: postDate,
-        image: postImg,
-        excerpt: ''
-      });
-    }
-  }
-
-  return results;
-}
-
-/**
- * Get latest uploaded papers
+ * 1. Get Grade 5 Scholarship Papers (ශිෂ්‍යත්ව විභාග ප්‍රශ්න පත්‍ර)
  * @param {object} [options]
  * @param {number} [options.page=1]
  * @param {number} [options.per_page=10]
- * @returns {Promise<Array>}
+ * @param {string} [options.type='all'] 'all' | 'past_papers' | 'model_papers' | 'term_test'
+ * @param {string} [options.medium] 'sinhala' | 'tamil'
  */
-async function getLatest(options = {}) {
-  const page = options.page || 1;
-  const perPage = options.per_page || 10;
-  const apiUrl = `${BASE_URL}/wp-json/wp/v2/posts?page=${page}&per_page=${perPage}&_embed`;
+async function getScholarshipPapers(options = {}) {
+  let q = 'scholarship';
+  if (options.type === 'model_papers') q = 'scholarship model paper';
+  else if (options.type === 'term_test') q = 'grade 5 term test paper';
+  else if (options.type === 'past_papers') q = 'grade 5 scholarship exam past paper';
 
-  const res = await fetchHtml(apiUrl, options);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch latest posts: HTTP ${res.status}`);
-  }
-
-  const posts = await res.json();
-  if (!Array.isArray(posts)) return [];
-
-  return posts.map(post => {
-    const featuredImg = post._embedded?.['wp:featuredmedia']?.[0]?.source_url || null;
-    return {
-      id: post.id,
-      title: decodeHtmlEntities(post.title?.rendered || ''),
-      url: post.link,
-      slug: post.slug,
-      date: post.date,
-      image: featuredImg,
-      excerpt: decodeHtmlEntities((post.excerpt?.rendered || '').replace(/<[^>]+>/g, '').trim())
-    };
-  });
+  if (options.medium) q += ` ${options.medium} medium`;
+  return search(q, options);
 }
 
 /**
- * Scrape all details, metadata, preview images and DOWNLOAD LINKS from a pastpapers.wiki post URL
- * @param {string} postUrl Full URL or post slug (e.g. 'https://pastpapers.wiki/2026-al-agricultural-science-past-paper-sinhala-medium/')
+ * 2. Get G.C.E. O/L Past Papers & Marking Schemes (සාමාන්‍ය පෙළ)
+ * @param {object} [options]
+ * @param {string} [options.subject] Subject name (e.g. 'science', 'mathematics', 'history', 'english', 'commerce', 'sinhala')
+ * @param {string} [options.year] Exam year (e.g. '2023', '2024', '2022')
+ * @param {string} [options.medium] 'sinhala' | 'english' | 'tamil'
+ * @param {boolean} [options.markingScheme=false] Set true to get marking schemes
+ */
+async function getOLPapers(options = {}) {
+  let q = 'O/L';
+  if (options.markingScheme) q += ' marking scheme';
+  else q += ' past paper';
+
+  if (options.subject) q += ` ${options.subject}`;
+  if (options.year) q += ` ${options.year}`;
+  if (options.medium) q += ` ${options.medium} medium`;
+
+  return search(q, options);
+}
+
+/**
+ * 3. Get G.C.E. A/L Past Papers & Marking Schemes (උසස් පෙළ)
+ * @param {object} [options]
+ * @param {string} [options.subject] Subject (e.g. 'biology', 'combined mathematics', 'physics', 'chemistry', 'accounting', 'ict', 'economics')
+ * @param {string} [options.year] Exam year (e.g. '2026', '2025', '2024', '2023')
+ * @param {string} [options.medium] 'sinhala' | 'english' | 'tamil'
+ * @param {boolean} [options.markingScheme=false] Set true for marking schemes
+ */
+async function getALPapers(options = {}) {
+  let q = 'A/L';
+  if (options.markingScheme) q += ' marking scheme';
+  else q += ' past paper';
+
+  if (options.subject) q += ` ${options.subject}`;
+  if (options.year) q += ` ${options.year}`;
+  if (options.medium) q += ` ${options.medium} medium`;
+
+  return search(q, options);
+}
+
+/**
+ * 4. Get Provincial / School Term Test Papers (වාර විභාග ප්‍රශ්න පත්‍ර - Grade 1 to 13)
+ * @param {number|string} grade Grade number (e.g. 6, 7, 8, 9, 10, 11, 12, 13)
+ * @param {object} [options]
+ * @param {string} [options.province] 'western' | 'southern' | 'central' | 'north western' | 'sabaragamuwa' | 'north central'
+ * @param {string} [options.subject] Subject name
+ * @param {string} [options.term] Term number ('1st term', '2nd term', '3rd term')
+ * @param {string} [options.medium] 'sinhala' | 'english' | 'tamil'
+ */
+async function getTermTestPapers(grade, options = {}) {
+  const gStr = String(grade).padStart(2, '0');
+  let q = `grade ${gStr} term test paper`;
+
+  if (options.province) q = `${options.province} province ${q}`;
+  if (options.term) q += ` ${options.term}`;
+  if (options.subject) q += ` ${options.subject}`;
+  if (options.medium) q += ` ${options.medium} medium`;
+
+  return search(q, options);
+}
+
+/**
+ * 5. Get School Textbooks (පාසල් පෙළපොත් - Grade 1 to 11)
+ * @param {number|string} [grade] Grade number (e.g. 6, 7, 8, 9, 10, 11)
+ * @param {object} [options]
+ * @param {string} [options.subject] Subject name
+ * @param {string} [options.medium] 'sinhala' | 'english' | 'tamil'
+ */
+async function getTextbooks(grade, options = {}) {
+  let q = 'textbook free download';
+  if (grade) {
+    const gStr = String(grade).padStart(2, '0');
+    q = `grade ${gStr} ${q}`;
+  }
+  if (options.subject) q += ` ${options.subject}`;
+  if (options.medium) q += ` ${options.medium} medium`;
+
+  return search(q, options);
+}
+
+/**
+ * Scrape all details, metadata, preview images and DOWNLOAD LINKS from any pastpapers.wiki URL
+ * Works on single paper posts AND hub/index pages.
+ * 
+ * @param {string} postUrl Full URL or post slug
  * @param {object} [options]
  * @returns {Promise<{
  *   title: string,
@@ -212,7 +277,8 @@ async function getLatest(options = {}) {
  *   description: string,
  *   metadata: Record<string, string>,
  *   preview_images: Array<{src: string, caption: string}>,
- *   downloads: Array<{title: string, url: string, preview_url: string|null, type: string}>
+ *   downloads: Array<{title: string, url: string, preview_url: string|null, type: string}>,
+ *   sub_links: Array<{title: string, url: string}>
  * }>}
  */
 async function getPostDetails(postUrl, options = {}) {
@@ -258,7 +324,7 @@ async function getPostDetails(postUrl, options = {}) {
       ? html.indexOf('<div class="jeg_share_bottom', startMarker)
       : html.indexOf('</article>', startMarker);
       
-    contentHtml = endMarker !== -1 ? html.substring(startMarker, endMarker) : html.substring(startMarker, startMarker + 35000);
+    contentHtml = endMarker !== -1 ? html.substring(startMarker, endMarker) : html.substring(startMarker, startMarker + 40000);
   }
 
   // 6. Extract Metadata (Exam, Grade, Subject, Medium, Year, etc.)
@@ -285,8 +351,9 @@ async function getPostDetails(postUrl, options = {}) {
     }
   }
 
-  // 8. Extract Download Links
+  // 8. Extract Download Links & Hub sub-links
   const downloads = [];
+  const subLinks = [];
   const seenUrls = new Set();
 
   // Method A: Structured wpfd download blocks
@@ -359,6 +426,13 @@ async function getPostDetails(postUrl, options = {}) {
         preview_url: null,
         type: type
       });
+    } else if (href.startsWith(BASE_URL) && !href.includes('/category/') && !href.includes('/tag/') && text.length > 3) {
+      // Hub sub-links (e.g. subject links on a grade hub page)
+      seenUrls.add(href);
+      subLinks.push({
+        title: text,
+        url: href
+      });
     }
   }
 
@@ -371,14 +445,16 @@ async function getPostDetails(postUrl, options = {}) {
     metadata,
     preview_images: previewImages,
     downloads_count: downloads.length,
-    downloads
+    downloads,
+    sub_links_count: subLinks.length,
+    sub_links: subLinks
   };
 }
 
 /**
  * Search and instantly scrape download links for top matches
  * @param {string} query Search query
- * @param {number} [limit=3] How many matching posts to scrape downloads for
+ * @param {number} [limit=3]
  * @returns {Promise<Array>}
  */
 async function searchAndGetDownloads(query, limit = 3) {
@@ -436,7 +512,6 @@ async function downloadFile(downloadUrl, outputFilePath, onProgress) {
     }
     fileStream.end();
   } else {
-    // Fallback arrayBuffer
     const arrayBuf = await res.arrayBuffer();
     const buf = Buffer.from(arrayBuf);
     fs.writeFileSync(outputFilePath, buf);
@@ -455,10 +530,13 @@ async function downloadFile(downloadUrl, outputFilePath, onProgress) {
   });
 }
 
-// CommonJS and ES Module exports
 module.exports = {
   search,
-  getLatest,
+  getScholarshipPapers,
+  getOLPapers,
+  getALPapers,
+  getTermTestPapers,
+  getTextbooks,
   getPostDetails,
   searchAndGetDownloads,
   downloadFile,
